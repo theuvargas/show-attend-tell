@@ -1,0 +1,11 @@
+[project]
+name = "show-attend-tell"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets[vision]>=4.0.0",
+    "marimo>=0.15.0",
+    "torch>=2.8.0",
+]
