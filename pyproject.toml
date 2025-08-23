@@ -7,5 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "datasets[vision]>=4.0.0",
     "marimo>=0.15.0",
+    "ruff>=0.12.10",
     "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
