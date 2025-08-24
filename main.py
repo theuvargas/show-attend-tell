@@ -17,18 +17,18 @@ def _():
     from torch.utils.data import Dataset, DataLoader
     from torch.nn.utils.rnn import pad_sequence
     from torchvision import transforms
-    from torchvision.models import regnet_y_3_2gf, RegNet_Y_3_2GF_Weights
+    from torchvision.models import regnet_y_1_6gf, RegNet_Y_1_6GF_Weights
     return (
         Counter,
         DataLoader,
         Dataset,
-        RegNet_Y_3_2GF_Weights,
+        RegNet_Y_1_6GF_Weights,
         load_dataset,
         mo,
         nn,
         pad_sequence,
         re,
-        regnet_y_3_2gf,
+        regnet_y_1_6gf,
         torch,
         tqdm,
         transforms,
@@ -177,20 +177,13 @@ def _(pad_sequence, torch):
 def _(
     CaptionCollate,
     FlickrDataset,
-    RegNet_Y_3_2GF_Weights,
+    RegNet_Y_1_6GF_Weights,
     build_vocab_from_dataset,
     ds,
 ):
     vocab = build_vocab_from_dataset(ds["train"], 5)
 
-    # transform = transforms.Compose([
-    #     transforms.Resize((224, 224)),
-    #     transforms.ToTensor(),
-    #     transforms.Normalize(mean=[0.485, 0.456, 0.406],
-    #                          std=[0.229, 0.224, 0.225])
-    # ])
-
-    weights = RegNet_Y_3_2GF_Weights.DEFAULT
+    weights = RegNet_Y_1_6GF_Weights.DEFAULT
 
     transform = weights.transforms()
 
@@ -211,7 +204,7 @@ def _(DataLoader, collate_fn, flickr_train):
         dataset=flickr_train,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=6,
         collate_fn=collate_fn
     )
     return (train_loader,)
@@ -259,24 +252,24 @@ def _(mo):
 
 
 @app.cell
-def _(regnet_y_3_2gf):
-    regnet_y_3_2gf()
+def _(regnet_y_1_6gf):
+    regnet_y_1_6gf()
     return
 
 
 @app.cell
-def _(RegNet_Y_3_2GF_Weights, nn, regnet_y_3_2gf):
+def _(RegNet_Y_1_6GF_Weights, nn, regnet_y_1_6gf):
     class Encoder(nn.Module):
         def __init__(self, is_trainable=False):
             super(Encoder, self).__init__()
 
-            weights = RegNet_Y_3_2GF_Weights.DEFAULT
-            regnet = regnet_y_3_2gf(weights=weights)
+            weights = RegNet_Y_1_6GF_Weights.DEFAULT
+            regnet = regnet_y_1_6gf(weights=weights)
 
             self.stem = regnet.stem
             self.trunk = regnet.trunk_output
 
-            self.output_dim = 1512
+            self.output_dim = regnet.fc.in_features # 888
 
             if not is_trainable:
                 for param in self.parameters():
@@ -314,6 +307,12 @@ def _(encoder, torch):
 @app.cell
 def _(features):
     features.shape
+    return
+
+
+@app.cell
+def _(encoder):
+    sum(param.numel() for param in encoder.parameters())
     return
 
 
