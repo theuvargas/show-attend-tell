@@ -395,7 +395,7 @@ def _(Attention, nn, torch):
             self.embedding = nn.Embedding(vocab_size, embed_dim)
             self.dropout = nn.Dropout(p=dropout)
             # input é um token + vetor de contexto
-            self.lstm_cell = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
+            self.decode_step = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
 
             # gate do contexto
             self.f_beta = nn.Linear(decoder_dim, encoder_dim)
@@ -416,7 +416,6 @@ def _(Attention, nn, torch):
 
         def init_hidden_state(self, encoder_features):
             mean_encoder_features = encoder_features.mean(dim=1)
-        
             h = self.init_h(mean_encoder_features)
             c = self.init_c(mean_encoder_features)
             return h, c
@@ -430,24 +429,40 @@ def _(Attention, nn, torch):
         
             decode_length = max(caption_lengths) - 1
 
+            # decode_length previsões de tamanho vocab_size
             predictions = torch.zeros(batch_size, decode_length, self.vocab_size).to(encoder_features.device)
+            # um alpha para cada região da imagem, para cada palavra
             alphas = torch.zeros(batch_size, decode_length, encoder_features.size(1)).to(encoder_features.device)
 
             for t in range(decode_length):
                 word_embedding_t = embeddings[:, t, :]
-            
+
+                # vetor de contexto através da atenção entre as features extraídas
+                # pelo encoder e o estado oculto do decoder
                 context_vector, alpha = self.attention(encoder_features, h)
 
-                lstm_input = torch.cat((word_embedding_t, context_vector), dim=1)
+                # 'knowing when to look'
+                gate = self.sigmoid(self.f_beta(h))
+                gated_context = gate * context_vector
 
-                h, c = self.lstm_cell(lstm_input, (h, c))
+                # o input para a LSTM é a concatenação do embedding
+                # e com o contexto
+                lstm_input = torch.cat((word_embedding_t, gated_context), dim=1)
 
+                # um passo da célula LSTM atualiza o hidden state
+                # depois, o hidden state é projetado no espaço do vocabulário por uma camada fully connected
+                h, c = self.decode_step(lstm_input, (h, c))
                 preds_t = self.fc(self.dropout(h))
 
                 predictions[:, t, :] = preds_t
                 alphas[:, t, :] = alpha
             
             return predictions, encoded_captions, caption_lengths, alphas
+    return
+
+
+@app.cell
+def _():
     return
 
 
