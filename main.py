@@ -43,7 +43,7 @@ def _(load_dataset):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(r"""## Vocabulary""")
+    mo.md(r"""## Vocabulário""")
     return
 
 
@@ -313,6 +313,141 @@ def _(features):
 @app.cell
 def _(encoder):
     sum(param.numel() for param in encoder.parameters())
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## Atenção""")
+    return
+
+
+@app.cell
+def _(nn):
+    class Attention(nn.Module):
+        def __init__(self, encoder_dim, decoder_dim, attention_dim):
+            super(Attention, self).__init__()
+
+            self.encoder_projection = nn.Linear(encoder_dim, attention_dim)
+            self.decoder_projection = nn.Linear(decoder_dim, attention_dim)
+
+            self.attn_scores_layer = nn.Linear(attention_dim, 1)
+
+            self.relu = nn.ReLU()
+            self.softmax = nn.Softmax(dim=1)
+
+        def forward(self, encoder_features, decoder_hidden):
+            """
+            Args:
+                encoder_features: dims (B, 49, 888)
+                decoder_features: dims (B, 512)
+            """
+        
+            # projeta os vetores do encoder e o do estado do decoder
+            # para o mesmo espaço
+            encoder_vec = self.encoder_projection(encoder_features)
+            decoder_vec = self.decoder_projection(decoder_hidden)
+
+            combined = self.relu(encoder_vec + decoder_vec.unsqueeze(1))
+
+            # computa os scores de atenção para cada local da imagem
+            attn_scores = self.attn_scores_layer(combined)
+            attn_scores = attn_scores.squeeze(2)
+
+            # normaliza os scores
+            alpha = self.softmax(attn_scores)
+
+            # vetor de contexto: soma ponderada (pela atenção) das features da imagem
+            context_vec = (encoder_features * alpha.unsqueeze(2)).sum(dim=1)
+
+            return context_vec, alpha
+    return (Attention,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## Decoder""")
+    return
+
+
+@app.cell
+def _(Attention, nn, torch):
+    class Decoder(nn.Module):
+        def __init__(
+            self,
+            embed_dim: int,
+            encoder_dim: int,
+            decoder_dim: int,
+            attention_dim: int,
+            vocab_size: int,
+            dropout=0.5,
+        ):
+            super(Decoder, self).__init__()
+
+            self.embed_dim = embed_dim
+            self.encoder_dim = encoder_dim
+            self.decoder_dim = decoder_dim
+            self.attention_dim = attention_dim
+            self.vocab_size = vocab_size
+
+            self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
+
+            self.embedding = nn.Embedding(vocab_size, embed_dim)
+            self.dropout = nn.Dropout(p=dropout)
+            # input é um token + vetor de contexto
+            self.lstm_cell = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
+
+            # gate do contexto
+            self.f_beta = nn.Linear(decoder_dim, encoder_dim)
+            self.sigmoid = nn.Sigmoid()
+
+            self.init_h = nn.Linear(encoder_dim, decoder_dim)
+            self.init_c = nn.Linear(encoder_dim, decoder_dim)
+
+            # mapeia o output da RNN para o vocabulário
+            self.fc = nn.Linear(decoder_dim, vocab_size)
+
+            self.init_weights()
+
+        def init_weights(self):
+            self.embedding.weight.data.uniform_(-0.1, 0.1)
+            self.fc.bias.data.fill_(0)
+            self.fc.weight.data.uniform_(-0.1, 0.1)
+
+        def init_hidden_state(self, encoder_features):
+            mean_encoder_features = encoder_features.mean(dim=1)
+        
+            h = self.init_h(mean_encoder_features)
+            c = self.init_c(mean_encoder_features)
+            return h, c
+
+        def forward(self, encoder_features, encoded_captions, caption_lengths):
+            batch_size = encoder_features.size(0)
+        
+            h, c = self.init_hidden_state(encoder_features)
+
+            embeddings = self.embedding(encoded_captions)
+        
+            decode_length = max(caption_lengths) - 1
+
+            predictions = torch.zeros(batch_size, decode_length, self.vocab_size).to(encoder_features.device)
+            alphas = torch.zeros(batch_size, decode_length, encoder_features.size(1)).to(encoder_features.device)
+
+            for t in range(decode_length):
+                word_embedding_t = embeddings[:, t, :]
+            
+                context_vector, alpha = self.attention(encoder_features, h)
+
+                lstm_input = torch.cat((word_embedding_t, context_vector), dim=1)
+
+                h, c = self.lstm_cell(lstm_input, (h, c))
+
+                preds_t = self.fc(self.dropout(h))
+
+                predictions[:, t, :] = preds_t
+                alphas[:, t, :] = alpha
+            
+            return predictions, encoded_captions, caption_lengths, alphas
     return
 
 
