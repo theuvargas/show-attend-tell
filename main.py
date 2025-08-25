@@ -12,20 +12,26 @@ def _():
     import numpy as np
     from datasets import load_dataset
     from collections import Counter
-    from tqdm import tqdm
+    from tqdm.notebook import tqdm
     import re
     from torch.utils.data import Dataset, DataLoader
     from torch.nn.utils.rnn import pad_sequence
     from torchvision import transforms
     from torchvision.models import regnet_y_1_6gf, RegNet_Y_1_6GF_Weights
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
+    from contextlib import nullcontext
     return (
         Counter,
         DataLoader,
         Dataset,
+        LRScheduler,
+        Optimizer,
         RegNet_Y_1_6GF_Weights,
         load_dataset,
         mo,
         nn,
+        nullcontext,
         pad_sequence,
         re,
         regnet_y_1_6gf,
@@ -35,12 +41,6 @@ def _():
     )
 
 
-@app.cell
-def _(load_dataset):
-    ds = load_dataset("jxie/flickr8k")
-    return (ds,)
-
-
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""## Vocabulário""")
@@ -48,7 +48,7 @@ def _(mo):
 
 
 @app.cell
-def _(Counter, re, torch, tqdm):
+def _(Counter, re, torch):
     class Vocabulary:
         def __init__(self, min_freq):
             self.min_freq = min_freq
@@ -100,7 +100,7 @@ def _(Counter, re, torch, tqdm):
     def build_vocab_from_dataset(dataset, min_freq=5):
         vocab = Vocabulary(min_freq)
 
-        for item in tqdm(dataset):
+        for item in dataset:
             for i in range(5):
                 caption_key = f"caption_{i}"
                 caption = item[caption_key]
@@ -114,7 +114,7 @@ def _(Counter, re, torch, tqdm):
         vocab.build_vocabulary()
 
         return vocab
-    return (build_vocab_from_dataset,)
+    return Vocabulary, build_vocab_from_dataset
 
 
 @app.cell(hide_code=True)
@@ -157,75 +157,23 @@ def _(Dataset, torch):
 @app.cell
 def _(pad_sequence, torch):
     class CaptionCollate:
+        def __init__(self, pad_idx=0):
+            self.pad_idx = pad_idx
+
         def __call__(self, batch):
             images = [item[0].unsqueeze(0) for item in batch]
             captions = [item[1] for item in batch]
 
-            images = torch.cat(images, dim=0)
+            caption_lengths = [len(cap) for cap in captions]
 
             padded_captions = pad_sequence(
-                captions, 
-                batch_first=True,
-                padding_value=0
+                captions, batch_first=True, padding_value=self.pad_idx
             )
 
-            return images, padded_captions
+            images = torch.cat(images, dim=0)
+
+            return images, padded_captions, caption_lengths
     return (CaptionCollate,)
-
-
-@app.cell
-def _(
-    CaptionCollate,
-    FlickrDataset,
-    RegNet_Y_1_6GF_Weights,
-    build_vocab_from_dataset,
-    ds,
-):
-    vocab = build_vocab_from_dataset(ds["train"], 5)
-
-    weights = RegNet_Y_1_6GF_Weights.DEFAULT
-
-    transform = weights.transforms()
-
-    flickr_train = FlickrDataset(
-        dataset=ds["train"],
-        vocab=vocab,
-        transform=transform
-    )
-
-    collate_fn = CaptionCollate()
-    return collate_fn, flickr_train, vocab
-
-
-@app.cell
-def _(DataLoader, collate_fn, flickr_train):
-    batch_size = 256
-    train_loader = DataLoader(
-        dataset=flickr_train,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=6,
-        collate_fn=collate_fn
-    )
-    return (train_loader,)
-
-
-@app.cell
-def _(train_loader):
-    images, captions = next(iter(train_loader))
-    return captions, images
-
-
-@app.cell
-def _(captions, vocab):
-    print(vocab.decode(captions[0]))
-    return
-
-
-@app.cell
-def _(images):
-    images[0].shape
-    return
 
 
 @app.cell
@@ -242,18 +190,12 @@ def _(transforms):
         pil_image = to_pil(tensor_copy)
     
         return pil_image
-    return
+    return (tensor2pil,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""## Encoder""")
-    return
-
-
-@app.cell
-def _(regnet_y_1_6gf):
-    regnet_y_1_6gf()
     return
 
 
@@ -289,31 +231,6 @@ def _(RegNet_Y_1_6GF_Weights, nn, regnet_y_1_6gf):
 
             return features
     return (Encoder,)
-
-
-@app.cell
-def _(Encoder):
-    encoder = Encoder(is_trainable=False)
-    return (encoder,)
-
-
-@app.cell
-def _(encoder, torch):
-    dummy_images = torch.randn(4, 3, 224, 224)
-    features = encoder(dummy_images)
-    return (features,)
-
-
-@app.cell
-def _(features):
-    features.shape
-    return
-
-
-@app.cell
-def _(encoder):
-    sum(param.numel() for param in encoder.parameters())
-    return
 
 
 @app.cell(hide_code=True)
@@ -380,7 +297,7 @@ def _(Attention, nn, torch):
             decoder_dim: int,
             attention_dim: int,
             vocab_size: int,
-            dropout=0.5,
+            dropout: float,
         ):
             super(Decoder, self).__init__()
 
@@ -420,19 +337,22 @@ def _(Attention, nn, torch):
             c = self.init_c(mean_encoder_features)
             return h, c
 
-        def forward(self, encoder_features, encoded_captions, caption_lengths):
+        def forward(self, encoder_features, captions, caption_lengths):
             batch_size = encoder_features.size(0)
-        
+
             h, c = self.init_hidden_state(encoder_features)
 
-            embeddings = self.embedding(encoded_captions)
-        
+            embeddings = self.embedding(captions)
+
             decode_length = max(caption_lengths) - 1
 
-            # decode_length previsões de tamanho vocab_size
-            predictions = torch.zeros(batch_size, decode_length, self.vocab_size).to(encoder_features.device)
+            predictions = torch.zeros(
+                batch_size, decode_length, self.vocab_size
+            ).to(encoder_features.device)
             # um alpha para cada região da imagem, para cada palavra
-            alphas = torch.zeros(batch_size, decode_length, encoder_features.size(1)).to(encoder_features.device)
+            alphas = torch.zeros(
+                batch_size, decode_length, encoder_features.size(1)
+            ).to(encoder_features.device)
 
             for t in range(decode_length):
                 word_embedding_t = embeddings[:, t, :]
@@ -456,13 +376,402 @@ def _(Attention, nn, torch):
 
                 predictions[:, t, :] = preds_t
                 alphas[:, t, :] = alpha
-            
-            return predictions, encoded_captions, caption_lengths, alphas
+
+            return predictions, alphas
+    return (Decoder,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## Encoder-Decoder""")
     return
 
 
 @app.cell
-def _():
+def _(Decoder, Encoder, Vocabulary, nn, torch):
+    class EncoderDecoder(nn.Module):
+        def __init__(self, encoder: Encoder, decoder: Decoder):
+            super(EncoderDecoder, self).__init__()
+            self.encoder = encoder
+            self.decoder = decoder
+
+        def forward(self, images, captions, caption_lengths):
+            features = self.encoder(images)
+            predictions, alphas = self.decoder(features, captions, caption_lengths)
+
+            return predictions, alphas
+
+        def generate_caption(self, image, vocab: Vocabulary, max_length=50):
+            self.eval()
+            device = image.device
+
+            with torch.no_grad():
+                features = self.encoder(image)
+
+                h, c = self.decoder.init_hidden_state(features)
+
+                start_token_idx = vocab.word2idx["<start>"]
+                input_word = torch.tensor([start_token_idx]).to(device)
+
+                predicted_indices = []
+                alphas_list = []
+
+                # loop de decoding autoregressivo
+                for t in range(max_length):
+                    embeddings = self.decoder.embedding(input_word)
+
+                    context_vector, alpha = self.decoder.attention(features, h)
+                    alphas_list.append(alpha.cpu())
+
+                    # 'Knowing when to look' gate
+                    gate = self.decoder.sigmoid(self.decoder.f_beta(h))
+                    gated_context = gate * context_vector
+
+                    lstm_input = torch.cat((embeddings, gated_context), dim=1)
+
+                    h, c = self.decoder.decode_step(lstm_input, (h, c))
+
+                    preds_t = self.decoder.fc(h)
+
+                    # seleciona a próxima palavra (greedy search)
+                    predicted_idx = preds_t.argmax(dim=1)
+                    predicted_indices.append(predicted_idx.item())
+
+                    if predicted_idx.item() == vocab.word2idx["<end>"]:
+                        break
+
+                    # autoregressivo
+                    input_word = predicted_idx
+
+            caption = vocab.decode(predicted_indices)        
+            attention_plot = torch.cat(alphas_list, dim=0)
+
+            return caption, attention_plot
+    return (EncoderDecoder,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## Trainer""")
+    return
+
+
+@app.cell
+def _(
+    DataLoader,
+    EncoderDecoder,
+    LRScheduler,
+    Optimizer,
+    nn,
+    nullcontext,
+    torch,
+    tqdm,
+):
+    class Trainer:
+        def __init__(
+            self,
+            model: EncoderDecoder,
+            optimizer: Optimizer,
+            criterion: nn.Module,
+            train_loader: DataLoader,
+            val_loader: DataLoader,
+            device: str | torch.device,
+            epochs: int,
+            alpha_c: float = 1.0,
+            lr_scheduler: LRScheduler | None = None,
+            clip_grad_norm: float | None = None,
+            checkpoint_path: str = "best_model.pth",
+        ):
+            self.model = model.to(device)
+            self.optimizer = optimizer
+            self.criterion = criterion
+            self.train_loader = train_loader
+            self.val_loader = val_loader
+            self.device = device
+            self.epochs = epochs
+            self.alpha_c = alpha_c
+            self.lr_scheduler = lr_scheduler
+            self.clip_grad_norm = clip_grad_norm
+            self.checkpoint_path = checkpoint_path
+
+            self.best_val_loss = float("inf")
+            self.history = {"train_loss": [], "val_loss": []}
+
+        def _run_epoch(
+            self, loader: DataLoader, is_training: bool, epoch_num: int = 0
+        ) -> float:
+            if is_training:
+                self.model.train()
+                desc = f"Training Epoch {epoch_num}/{self.epochs}"
+            else:
+                self.model.eval()
+                desc = "Validating"
+
+            total_loss = 0.0
+            progress_bar = tqdm(loader, desc=desc)
+
+            # torch.no_grad para validação
+            context = nullcontext() if is_training else torch.no_grad()
+
+            with context:
+                for images, captions, caption_lengths in progress_bar:
+                    images = images.to(self.device)
+                    captions = captions.to(self.device)
+
+                    if is_training:
+                        self.optimizer.zero_grad()
+
+                    predictions, alphas = self.model(
+                        images, captions, caption_lengths
+                    )
+                    targets = captions[:, 1:]
+
+                    predictions_flat = predictions.view(
+                        -1, self.model.decoder.vocab_size
+                    )
+                    targets_flat = targets.reshape(-1)
+
+                    caption_loss = self.criterion(predictions_flat, targets_flat)
+                    attention_loss = (
+                        self.alpha_c * ((1.0 - alphas.sum(dim=2)) ** 2).mean()
+                    )
+                    loss = caption_loss + attention_loss
+
+                    if is_training:
+                        loss.backward()
+                        if self.clip_grad_norm is not None:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.clip_grad_norm
+                            )
+                        self.optimizer.step()
+
+                    total_loss += loss.item()
+
+            return total_loss / len(loader)
+
+        def train(self):
+            print(f"Começando o treino em {self.device}...")
+            for epoch in range(1, self.epochs + 1):
+                train_loss = self._run_epoch(
+                    self.train_loader, is_training=True, epoch_num=epoch
+                )
+                val_loss = self._run_epoch(self.val_loader, is_training=False)
+
+                print(
+                    f"\nÉpoca {epoch}/{self.epochs}\n"
+                    f"Loss de treino: {train_loss:.4f}, Loss de validação: {val_loss:.4f}"
+                )
+
+                self.history["train_loss"].append(train_loss)
+                self.history["val_loss"].append(val_loss)
+
+                if self.lr_scheduler:
+                    if isinstance(
+                        self.lr_scheduler,
+                        torch.optim.lr_scheduler.ReduceLROnPlateau,
+                    ):
+                        self.lr_scheduler.step(val_loss)
+                    else:
+                        self.lr_scheduler.step()
+
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), self.checkpoint_path)
+                    print(
+                        f"Novo melhor modelo salvo em {self.checkpoint_path} (Val Loss: {val_loss:.4f})"
+                    )
+
+            print("Training finished.")
+    return (Trainer,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## Testes""")
+    return
+
+
+@app.cell
+def _(load_dataset):
+    ds = load_dataset("jxie/flickr8k")
+    return (ds,)
+
+
+@app.cell
+def _(torch):
+    config = {
+        "epochs": 4,
+        "batch_size": 256,
+        "learning_rate": 4e-4,
+        "embed_dim": 512,
+        "decoder_dim": 512,
+        "attention_dim": 512,
+        "encoder_dim": 888,  # RegNet
+        "dropout": 0.5,
+        "min_freq": 5,
+        "grad_clip": 5.0,
+        "alpha_c": 1.0,  # regularização da atenção
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+    }
+    return
+
+
+@app.cell
+def _(ds):
+    train_data = ds["train"]
+    val_data = ds["validation"]
+    return train_data, val_data
+
+
+@app.cell
+def _(
+    CaptionCollate,
+    DataLoader,
+    FlickrDataset,
+    RegNet_Y_1_6GF_Weights,
+    build_vocab_from_dataset,
+    train_data,
+    val_data,
+):
+    vocab = build_vocab_from_dataset(train_data, min_freq=5)
+
+    weights = RegNet_Y_1_6GF_Weights.DEFAULT
+    transform = weights.transforms()
+
+    train_dataset = FlickrDataset(dataset=train_data, vocab=vocab, transform=transform)
+    val_dataset = FlickrDataset(dataset=val_data, vocab=vocab, transform=transform)
+
+    pad_idx = vocab.word2idx["<pad>"]
+    collate_fn = CaptionCollate(pad_idx=pad_idx)
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=collate_fn,
+    )
+    return pad_idx, train_loader, val_loader, vocab
+
+
+@app.cell
+def _(Decoder, Encoder, EncoderDecoder, torch, vocab):
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    EMBED_DIM = 256
+    ENCODER_DIM = 888  # From RegNet
+    DECODER_DIM = 512
+    ATTENTION_DIM = 512
+    ENCODER_LR = 1e-4
+    DECODER_LR = 4e-4
+    EPOCHS = 4
+    DROPOUT = 0.5
+    VOCAB_SIZE = len(vocab)
+
+    encoder = Encoder(is_trainable=True)
+    decoder = Decoder(
+        embed_dim=EMBED_DIM,
+        encoder_dim=ENCODER_DIM,
+        decoder_dim=DECODER_DIM,
+        attention_dim=ATTENTION_DIM,
+        vocab_size=VOCAB_SIZE,
+        dropout=DROPOUT,
+    )
+    model = EncoderDecoder(encoder, decoder)
+    return DECODER_LR, DEVICE, ENCODER_LR, EPOCHS, model
+
+
+@app.cell
+def _(DECODER_LR, ENCODER_LR, model, nn, pad_idx, torch):
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": filter(
+                    lambda p: p.requires_grad, model.encoder.parameters()
+                ),
+                "lr": ENCODER_LR,
+            },
+            {
+                "params": filter(
+                    lambda p: p.requires_grad, model.decoder.parameters()
+                ),
+                "lr": DECODER_LR,
+            },
+        ]
+    )
+
+
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.1, patience=3
+    )
+    return criterion, lr_scheduler, optimizer
+
+
+@app.cell
+def _(
+    DEVICE,
+    EPOCHS,
+    Trainer,
+    criterion,
+    lr_scheduler,
+    model,
+    optimizer,
+    train_loader,
+    val_loader,
+):
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=DEVICE,
+        epochs=EPOCHS,
+        alpha_c=1.0,
+        lr_scheduler=lr_scheduler,
+        clip_grad_norm=5.0,
+        checkpoint_path="show_attend_tell_best.pth",
+    )
+    return (trainer,)
+
+
+@app.cell
+def _(trainer):
+    trainer.train()
+    return
+
+
+@app.cell
+def _(DEVICE, train_loader):
+    images, captions, cap_lens = next(iter(train_loader))
+    img = images[0].unsqueeze(0).to(DEVICE)
+    return captions, images, img
+
+
+@app.cell
+def _(img, model, vocab):
+    model.generate_caption(image=img, max_length=50, vocab=vocab)
+    return
+
+
+@app.cell
+def _(captions, vocab):
+    vocab.decode(captions[0])
+    return
+
+
+@app.cell
+def _(images, tensor2pil):
+    tensor2pil(images[0])
     return
 
 
