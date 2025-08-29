@@ -22,11 +22,13 @@ def _():
     from torch.optim.lr_scheduler import LRScheduler
     from contextlib import nullcontext
     import wandb
+    from typing import Literal
     return (
         Counter,
         DataLoader,
         Dataset,
         LRScheduler,
+        Literal,
         Optimizer,
         RegNet_Y_1_6GF_Weights,
         load_dataset,
@@ -289,10 +291,11 @@ def _(mo):
 
 
 @app.cell
-def _(Attention, nn, torch):
+def _(Attention, Literal, nn, torch):
     class Decoder(nn.Module):
         def __init__(
             self,
+            decoder_type: Literal["rnn", "lstm", "gru"],
             embed_dim: int,
             encoder_dim: int,
             decoder_dim: int,
@@ -303,6 +306,7 @@ def _(Attention, nn, torch):
         ):
             super(Decoder, self).__init__()
 
+            self.decoder_type = decoder_type
             self.embed_dim = embed_dim
             self.encoder_dim = encoder_dim
             self.decoder_dim = decoder_dim
@@ -314,8 +318,16 @@ def _(Attention, nn, torch):
 
             self.embedding = nn.Embedding(vocab_size, embed_dim)
             self.dropout = nn.Dropout(p=dropout)
+
             # input é um token + vetor de contexto
-            self.decode_step = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
+            if decoder_type == "rnn":
+                self.decode_step = nn.RNNCell(embed_dim + encoder_dim, decoder_dim)
+            elif decoder_type == "lstm":
+                self.decode_step = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
+            elif decoder_type == "gru":
+                self.decode_step = nn.GRUCell(embed_dim + encoder_dim, decoder_dim)
+            else:
+                raise ValueError("decoder_type deve estar em [rnn, lstm, gru]")
 
             if use_gate:
                 # gate do contexto
@@ -323,7 +335,8 @@ def _(Attention, nn, torch):
                 self.sigmoid = nn.Sigmoid()
 
             self.init_h = nn.Linear(encoder_dim, decoder_dim)
-            self.init_c = nn.Linear(encoder_dim, decoder_dim)
+            if decoder_type == "lstm":
+                self.init_c = nn.Linear(encoder_dim, decoder_dim)
 
             # mapeia o output da RNN para o vocabulário
             self.fc = nn.Linear(decoder_dim, vocab_size)
@@ -338,13 +351,15 @@ def _(Attention, nn, torch):
         def init_hidden_state(self, encoder_features):
             mean_encoder_features = encoder_features.mean(dim=1)
             h = self.init_h(mean_encoder_features)
-            c = self.init_c(mean_encoder_features)
-            return h, c
+            if self.decoder_type == "lstm":
+                c = self.init_c(mean_encoder_features)
+                return h, c
+            return h
 
         def forward(self, encoder_features, captions, caption_lengths):
             batch_size = encoder_features.size(0)
 
-            h, c = self.init_hidden_state(encoder_features)
+            hidden_state = self.init_hidden_state(encoder_features)
 
             embeddings = self.embedding(captions)
 
@@ -361,6 +376,7 @@ def _(Attention, nn, torch):
             for t in range(decode_length):
                 word_embedding_t = embeddings[:, t, :]
 
+                h = hidden_state[0] if self.decoder_type == "lstm" else hidden_state
                 # vetor de contexto através da atenção entre as features extraídas
                 # pelo encoder e o estado oculto do decoder
                 context_vector, alpha = self.attention(encoder_features, h)
@@ -372,13 +388,14 @@ def _(Attention, nn, torch):
                 else:
                     gated_context = context_vector
 
-                # o input para a LSTM é a concatenação do embedding
-                # e com o contexto
-                lstm_input = torch.cat((word_embedding_t, gated_context), dim=1)
+                # o input para a RNN é a concatenação do embedding com o contexto
+                rnn_input = torch.cat((word_embedding_t, gated_context), dim=1)
 
                 # um passo da célula LSTM atualiza o hidden state
-                # depois, o hidden state é projetado no espaço do vocabulário por uma camada fully connected
-                h, c = self.decode_step(lstm_input, (h, c))
+                hidden_state = self.decode_step(rnn_input, hidden_state)
+                h = hidden_state[0] if self.decoder_type == "lstm" else hidden_state
+
+                # o hidden state é projetado no espaço do vocabulário por uma camada fully connected
                 preds_t = self.fc(self.dropout(h))
 
                 predictions[:, t, :] = preds_t
@@ -415,7 +432,12 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
             with torch.no_grad():
                 features = self.encoder(image)
 
-                h, c = self.decoder.init_hidden_state(features)
+                hidden_state = self.decoder.init_hidden_state(features)
+                h = (
+                    hidden_state[0]
+                    if self.decoder.decoder_type == "lstm"
+                    else hidden_state
+                )
 
                 start_token_idx = vocab.word2idx["<start>"]
                 input_word = torch.tensor([start_token_idx]).to(device)
@@ -437,9 +459,14 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     else:
                         gated_context = context_vector
 
-                    lstm_input = torch.cat((embeddings, gated_context), dim=1)
+                    rnn_input = torch.cat((embeddings, gated_context), dim=1)
 
-                    h, c = self.decoder.decode_step(lstm_input, (h, c))
+                    hidden_state = self.decoder.decode_step(rnn_input, hidden_state)
+                    h = (
+                        hidden_state[0]
+                        if self.decoder.decoder_type == "lstm"
+                        else hidden_state
+                    )
 
                     preds_t = self.decoder.fc(h)
 
@@ -453,7 +480,7 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     # autoregressivo
                     input_word = predicted_idx
 
-            caption = vocab.decode(predicted_indices)        
+            caption = vocab.decode(predicted_indices)
             attention_plot = torch.cat(alphas_list, dim=0)
 
             return caption, attention_plot
@@ -688,16 +715,18 @@ def _(Decoder, Encoder, EncoderDecoder, torch, vocab):
     VOCAB_SIZE = len(vocab)
     TRAIN_ENCODER = False
     USE_GATE = False
+    DECODER_TYPE = "gru"
 
     encoder = Encoder(is_trainable=TRAIN_ENCODER)
     decoder = Decoder(
+        decoder_type=DECODER_TYPE,
         embed_dim=EMBED_DIM,
         encoder_dim=ENCODER_DIM,
         decoder_dim=DECODER_DIM,
         attention_dim=ATTENTION_DIM,
         vocab_size=VOCAB_SIZE,
         dropout=DROPOUT,
-        use_gate=False
+        use_gate=False,
     )
     model = EncoderDecoder(encoder, decoder)
     return DECODER_LR, DEVICE, ENCODER_LR, EPOCHS, model
