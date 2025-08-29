@@ -10,4 +10,5 @@ dependencies = [
     "ruff>=0.12.10",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
+    "wandb>=0.21.2",
 ]
