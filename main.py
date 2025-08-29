@@ -21,6 +21,7 @@ def _():
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
     from contextlib import nullcontext
+    import wandb
     return (
         Counter,
         DataLoader,
@@ -181,14 +182,14 @@ def _(transforms):
     def tensor2pil(tensor):
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
-    
+
         tensor_copy = tensor.clone() 
         for t, m, s in zip(tensor_copy, mean, std):
             t.mul_(s).add_(m) # t = t * s + m
-    
+
         to_pil = transforms.ToPILImage()
         pil_image = to_pil(tensor_copy)
-    
+
         return pil_image
     return (tensor2pil,)
 
@@ -259,7 +260,7 @@ def _(nn):
                 encoder_features: dims (B, 49, 888)
                 decoder_features: dims (B, 512)
             """
-        
+
             # projeta os vetores do encoder e o do estado do decoder
             # para o mesmo espaço
             encoder_vec = self.encoder_projection(encoder_features)
@@ -298,6 +299,7 @@ def _(Attention, nn, torch):
             attention_dim: int,
             vocab_size: int,
             dropout: float,
+            use_gate: bool,
         ):
             super(Decoder, self).__init__()
 
@@ -306,6 +308,7 @@ def _(Attention, nn, torch):
             self.decoder_dim = decoder_dim
             self.attention_dim = attention_dim
             self.vocab_size = vocab_size
+            self.use_gate = use_gate
 
             self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
 
@@ -314,9 +317,10 @@ def _(Attention, nn, torch):
             # input é um token + vetor de contexto
             self.decode_step = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
 
-            # gate do contexto
-            self.f_beta = nn.Linear(decoder_dim, encoder_dim)
-            self.sigmoid = nn.Sigmoid()
+            if use_gate:
+                # gate do contexto
+                self.f_beta = nn.Linear(decoder_dim, encoder_dim)
+                self.sigmoid = nn.Sigmoid()
 
             self.init_h = nn.Linear(encoder_dim, decoder_dim)
             self.init_c = nn.Linear(encoder_dim, decoder_dim)
@@ -361,9 +365,12 @@ def _(Attention, nn, torch):
                 # pelo encoder e o estado oculto do decoder
                 context_vector, alpha = self.attention(encoder_features, h)
 
-                # 'knowing when to look'
-                gate = self.sigmoid(self.f_beta(h))
-                gated_context = gate * context_vector
+                if self.use_gate:
+                    # 'knowing when to look'
+                    gate = self.sigmoid(self.f_beta(h))
+                    gated_context = gate * context_vector
+                else:
+                    gated_context = context_vector
 
                 # o input para a LSTM é a concatenação do embedding
                 # e com o contexto
@@ -423,9 +430,12 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     context_vector, alpha = self.decoder.attention(features, h)
                     alphas_list.append(alpha.cpu())
 
-                    # 'Knowing when to look' gate
-                    gate = self.decoder.sigmoid(self.decoder.f_beta(h))
-                    gated_context = gate * context_vector
+                    if self.decoder.use_gate:
+                        # 'Knowing when to look' gate
+                        gate = self.decoder.sigmoid(self.decoder.f_beta(h))
+                        gated_context = gate * context_vector
+                    else:
+                        gated_context = context_vector
 
                     lstm_input = torch.cat((embeddings, gated_context), dim=1)
 
@@ -481,6 +491,7 @@ def _(
             lr_scheduler: LRScheduler | None = None,
             clip_grad_norm: float | None = None,
             checkpoint_path: str = "best_model.pth",
+            wandb_run=None,
         ):
             self.model = model.to(device)
             self.optimizer = optimizer
@@ -493,6 +504,7 @@ def _(
             self.lr_scheduler = lr_scheduler
             self.clip_grad_norm = clip_grad_norm
             self.checkpoint_path = checkpoint_path
+            self.wandb_run = wandb_run
 
             self.best_val_loss = float("inf")
             self.history = {"train_loss": [], "val_loss": []}
@@ -671,11 +683,13 @@ def _(Decoder, Encoder, EncoderDecoder, torch, vocab):
     ATTENTION_DIM = 512
     ENCODER_LR = 1e-4
     DECODER_LR = 4e-4
-    EPOCHS = 4
+    EPOCHS = 1
     DROPOUT = 0.5
     VOCAB_SIZE = len(vocab)
+    TRAIN_ENCODER = False
+    USE_GATE = False
 
-    encoder = Encoder(is_trainable=True)
+    encoder = Encoder(is_trainable=TRAIN_ENCODER)
     decoder = Decoder(
         embed_dim=EMBED_DIM,
         encoder_dim=ENCODER_DIM,
@@ -683,6 +697,7 @@ def _(Decoder, Encoder, EncoderDecoder, torch, vocab):
         attention_dim=ATTENTION_DIM,
         vocab_size=VOCAB_SIZE,
         dropout=DROPOUT,
+        use_gate=False
     )
     model = EncoderDecoder(encoder, decoder)
     return DECODER_LR, DEVICE, ENCODER_LR, EPOCHS, model
@@ -772,6 +787,11 @@ def _(captions, vocab):
 @app.cell
 def _(images, tensor2pil):
     tensor2pil(images[0])
+    return
+
+
+@app.cell
+def _():
     return
 
 
