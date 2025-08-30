@@ -23,10 +23,14 @@ def _():
     from contextlib import nullcontext
     import wandb
     from typing import Literal
+    import torch.nn.functional as F
+    from PIL import Image
+    import matplotlib.pyplot as plt
     return (
         Counter,
         DataLoader,
         Dataset,
+        F,
         LRScheduler,
         Literal,
         Optimizer,
@@ -34,8 +38,10 @@ def _():
         load_dataset,
         mo,
         nn,
+        np,
         nullcontext,
         pad_sequence,
+        plt,
         re,
         regnet_y_1_6gf,
         torch,
@@ -447,10 +453,11 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                 input_word = torch.tensor([start_token_idx]).to(device)
 
                 predicted_indices = []
+                predicted_words = []
                 alphas_list = []
 
                 unk_token_idx = vocab.word2idx["<unk>"]
-            
+
                 # loop de decoding autoregressivo
                 for t in range(max_length):
                     embeddings = self.decoder.embedding(input_word)
@@ -485,13 +492,14 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     if predicted_idx.item() == vocab.word2idx["<end>"]:
                         break
 
+                    predicted_words.append(vocab.idx2word[predicted_idx.item()])
                     # autoregressivo
                     input_word = predicted_idx
 
             caption = vocab.decode(predicted_indices)
             attention_plot = torch.cat(alphas_list, dim=0)
 
-            return caption, attention_plot
+            return caption, attention_plot, predicted_words
     return (EncoderDecoder,)
 
 
@@ -502,12 +510,59 @@ def _(mo):
 
 
 @app.cell
+def _(F, np, plt, tensor2pil, wandb):
+    def create_attention_maps(image_tensor, attention_plot, words):
+        pil_image = tensor2pil(image_tensor)
+        image_width, image_height = pil_image.size
+
+        num_features = attention_plot.shape[1]
+        feature_map_size = int(np.sqrt(num_features))
+
+        if feature_map_size**2 != num_features:
+            raise ValueError("Não é possível criar a visualização")
+
+        attention_maps = []
+
+        num_steps = attention_plot.shape[0]
+        words_to_plot = words[:num_steps]
+
+        for word, alpha in zip(words_to_plot, attention_plot):
+            fig, ax = plt.subplots(figsize=(8, 8))
+
+            ax.imshow(pil_image)
+            ax.set_title(f"Atenção para: '{word}'", fontsize=16)
+            ax.axis("off")
+
+            alpha_map = alpha.view(1, 1, feature_map_size, feature_map_size)
+            alpha_map_resized = (
+                F.interpolate(
+                    alpha_map,
+                    size=(image_height, image_width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                .squeeze()
+                .numpy()
+            )
+
+            ax.imshow(alpha_map_resized, alpha=0.6, cmap="jet")
+            plt.tight_layout()
+
+            attention_maps.append(wandb.Image(plt))
+
+            plt.close(fig)
+
+        return attention_maps
+    return (create_attention_maps,)
+
+
+@app.cell
 def _(
-    DEVICE,
     DataLoader,
     EncoderDecoder,
     LRScheduler,
     Optimizer,
+    create_attention_maps,
     nn,
     nullcontext,
     tensor2pil,
@@ -550,10 +605,11 @@ def _(
             for i, (img, cap) in enumerate(zip(images, captions)):
                 if i == 3:
                     break
-                self.val_samples.append((img.unsqueeze(0).to(DEVICE), cap))
+                self.val_samples.append((img.unsqueeze(0).to(device), cap))
 
         def _log_predictions(self, epoch: int):
             self.model.eval()
+            vocab = self.val_loader.dataset.vocab
 
             log_table = wandb.Table(
                 columns=[
@@ -563,19 +619,33 @@ def _(
                     "Legenda de Referência",
                 ]
             )
-            vocab = self.val_loader.dataset.vocab
 
-            for img, cap in self.val_samples:
-                gen_cap = self.model.generate_caption(
-                    image=img.to(self.device), max_length=50, vocab=vocab
-                )[0]
-
-                print(cap, vocab.decode(cap))
-                log_table.add_data(
-                    epoch, wandb.Image(tensor2pil(img)), gen_cap, vocab.decode(cap)
+            for img_tensor, cap_tensor in self.val_samples:
+                gen_cap, _, _ = self.model.generate_caption(
+                    image=img_tensor, max_length=50, vocab=vocab
                 )
+                log_table.add_data(
+                    epoch,
+                    wandb.Image(tensor2pil(img_tensor)),
+                    gen_cap,
+                    vocab.decode(cap_tensor),
+                )
+            wandb.log({"predictions_table": log_table})
 
-            wandb.log({"previsões": log_table})
+            img_sample, _ = self.val_samples[0]
+
+            gen_cap, attention_plot, gen_words = self.model.generate_caption(
+                image=img_sample, max_length=50, vocab=vocab
+            )
+
+            attention_maps = create_attention_maps(
+                image_tensor=img_sample,
+                attention_plot=attention_plot,
+                words=gen_words,
+            )
+
+            if attention_maps:
+                wandb.log({f"Epoch {epoch} Attention Maps": attention_maps})
 
         def _run_epoch(
             self, loader: DataLoader, is_training: bool, epoch_num: int = 0
@@ -688,7 +758,7 @@ def _(mo):
 @app.cell
 def _(load_dataset):
     ds = load_dataset("jxie/flickr8k")
-    return (ds,)
+    return
 
 
 @app.cell
@@ -724,7 +794,7 @@ def _(
             "embed_dim": 256,
             "decoder_dim": 512,
             "attention_dim": 512,
-            "encoder_dim": 888, # RegNet
+            "encoder_dim": 888,  # RegNet
             "dropout": 0.5,
             "encoder_lr": 1e-4,
             "decoder_lr": 4e-4,
@@ -770,7 +840,7 @@ def _(
             collate_fn=collate_fn,
         )
 
-        DEVICE = "cuda" # if torch.cuda.is_available() else "cpu"
+        DEVICE = "cuda"  # if torch.cuda.is_available() else "cpu"
 
         encoder = Encoder(is_trainable=config.finetune_encoder)
         decoder = Decoder(
@@ -833,194 +903,6 @@ def _(
 @app.cell
 def _(run):
     run()
-    return
-
-
-@app.cell
-def _(torch):
-    config = {
-        "epochs": 4,
-        "batch_size": 256,
-        "learning_rate": 4e-4,
-        "embed_dim": 512,
-        "decoder_dim": 512,
-        "attention_dim": 512,
-        "encoder_dim": 888,  # RegNet
-        "dropout": 0.5,
-        "min_freq": 5,
-        "grad_clip": 5.0,
-        "alpha_c": 1.0,  # regularização da atenção
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-    }
-    return
-
-
-@app.cell
-def _(ds):
-    train_data = ds["train"]
-    val_data = ds["validation"]
-    return train_data, val_data
-
-
-@app.cell
-def _(
-    CaptionCollate,
-    DataLoader,
-    FlickrDataset,
-    RegNet_Y_1_6GF_Weights,
-    build_vocab_from_dataset,
-    train_data,
-    val_data,
-):
-    vocab = build_vocab_from_dataset(train_data, min_freq=5)
-
-    weights = RegNet_Y_1_6GF_Weights.DEFAULT
-    transform = weights.transforms()
-
-    train_dataset = FlickrDataset(dataset=train_data, vocab=vocab, transform=transform)
-    val_dataset = FlickrDataset(dataset=val_data, vocab=vocab, transform=transform)
-
-    pad_idx = vocab.word2idx["<pad>"]
-    collate_fn = CaptionCollate(pad_idx=pad_idx)
-
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=32,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collate_fn,
-    )
-
-    val_loader = DataLoader(
-        dataset=val_dataset,
-        batch_size=32,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=collate_fn,
-    )
-    return pad_idx, train_loader, val_loader, vocab
-
-
-@app.cell
-def _(Decoder, Encoder, EncoderDecoder, torch, vocab):
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    EMBED_DIM = 256
-    ENCODER_DIM = 888  # From RegNet
-    DECODER_DIM = 512
-    ATTENTION_DIM = 512
-    ENCODER_LR = 1e-4
-    DECODER_LR = 4e-4
-    EPOCHS = 1
-    DROPOUT = 0.5
-    VOCAB_SIZE = len(vocab)
-    TRAIN_ENCODER = False
-    USE_GATE = False
-    DECODER_TYPE = "gru"
-
-    encoder = Encoder(is_trainable=TRAIN_ENCODER)
-    decoder = Decoder(
-        decoder_type=DECODER_TYPE,
-        embed_dim=EMBED_DIM,
-        encoder_dim=ENCODER_DIM,
-        decoder_dim=DECODER_DIM,
-        attention_dim=ATTENTION_DIM,
-        vocab_size=VOCAB_SIZE,
-        dropout=DROPOUT,
-        use_gate=False,
-    )
-    model = EncoderDecoder(encoder, decoder)
-    return DECODER_LR, DEVICE, ENCODER_LR, EPOCHS, model
-
-
-@app.cell
-def _(DECODER_LR, ENCODER_LR, model, nn, pad_idx, torch):
-    optimizer = torch.optim.Adam(
-        [
-            {
-                "params": filter(
-                    lambda p: p.requires_grad, model.encoder.parameters()
-                ),
-                "lr": ENCODER_LR,
-            },
-            {
-                "params": filter(
-                    lambda p: p.requires_grad, model.decoder.parameters()
-                ),
-                "lr": DECODER_LR,
-            },
-        ]
-    )
-
-
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.1, patience=3
-    )
-    return criterion, lr_scheduler, optimizer
-
-
-@app.cell
-def _(
-    DEVICE,
-    EPOCHS,
-    Trainer,
-    criterion,
-    lr_scheduler,
-    model,
-    optimizer,
-    train_loader,
-    val_loader,
-):
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        criterion=criterion,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=DEVICE,
-        epochs=EPOCHS,
-        alpha_c=1.0,
-        lr_scheduler=lr_scheduler,
-        clip_grad_norm=5.0,
-        checkpoint_path="show_attend_tell_best.pth",
-    )
-    return (trainer,)
-
-
-@app.cell
-def _(trainer):
-    trainer.train()
-    return
-
-
-@app.cell
-def _(DEVICE, train_loader):
-    images, captions, cap_lens = next(iter(train_loader))
-    img = images[0].unsqueeze(0).to(DEVICE)
-    return captions, images, img
-
-
-@app.cell
-def _(img, model, vocab):
-    model.generate_caption(image=img, max_length=50, vocab=vocab)
-    return
-
-
-@app.cell
-def _(captions, vocab):
-    vocab.decode(captions[0])
-    return
-
-
-@app.cell
-def _(images, tensor2pil):
-    tensor2pil(images[0])
-    return
-
-
-@app.cell
-def _():
     return
 
 
