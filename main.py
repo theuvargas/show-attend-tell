@@ -41,6 +41,7 @@ def _():
         torch,
         tqdm,
         transforms,
+        wandb,
     )
 
 
@@ -95,6 +96,9 @@ def _(Counter, re, torch):
             if isinstance(seq, torch.Tensor):
                 seq = seq.cpu().tolist()
 
+            if isinstance(seq, int):
+                seq = [seq]
+            
             return " ".join(
                 [self.idx2word.get(idx, "<unk>") for idx in seq if idx >= 3]
             )
@@ -185,9 +189,9 @@ def _(transforms):
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
 
-        tensor_copy = tensor.clone() 
+        tensor_copy = tensor.clone().squeeze()
         for t, m, s in zip(tensor_copy, mean, std):
-            t.mul_(s).add_(m) # t = t * s + m
+            t.mul_(s).add_(m)  # t = t * s + m
 
         to_pil = transforms.ToPILImage()
         pil_image = to_pil(tensor_copy)
@@ -445,6 +449,8 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                 predicted_indices = []
                 alphas_list = []
 
+                unk_token_idx = vocab.word2idx["<unk>"]
+            
                 # loop de decoding autoregressivo
                 for t in range(max_length):
                     embeddings = self.decoder.embedding(input_word)
@@ -453,7 +459,6 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     alphas_list.append(alpha.cpu())
 
                     if self.decoder.use_gate:
-                        # 'Knowing when to look' gate
                         gate = self.decoder.sigmoid(self.decoder.f_beta(h))
                         gated_context = gate * context_vector
                     else:
@@ -469,6 +474,9 @@ def _(Decoder, Encoder, Vocabulary, nn, torch):
                     )
 
                     preds_t = self.decoder.fc(h)
+
+                    # mascara o token <unk>
+                    preds_t[:, unk_token_idx] = -torch.inf
 
                     # seleciona a próxima palavra (greedy search)
                     predicted_idx = preds_t.argmax(dim=1)
@@ -495,14 +503,17 @@ def _(mo):
 
 @app.cell
 def _(
+    DEVICE,
     DataLoader,
     EncoderDecoder,
     LRScheduler,
     Optimizer,
     nn,
     nullcontext,
+    tensor2pil,
     torch,
     tqdm,
+    wandb,
 ):
     class Trainer:
         def __init__(
@@ -518,7 +529,6 @@ def _(
             lr_scheduler: LRScheduler | None = None,
             clip_grad_norm: float | None = None,
             checkpoint_path: str = "best_model.pth",
-            wandb_run=None,
         ):
             self.model = model.to(device)
             self.optimizer = optimizer
@@ -531,20 +541,51 @@ def _(
             self.lr_scheduler = lr_scheduler
             self.clip_grad_norm = clip_grad_norm
             self.checkpoint_path = checkpoint_path
-            self.wandb_run = wandb_run
 
             self.best_val_loss = float("inf")
             self.history = {"train_loss": [], "val_loss": []}
+
+            self.val_samples = []
+            images, captions, _ = next(iter(train_loader))
+            for i, (img, cap) in enumerate(zip(images, captions)):
+                if i == 3:
+                    break
+                self.val_samples.append((img.unsqueeze(0).to(DEVICE), cap))
+
+        def _log_predictions(self, epoch: int):
+            self.model.eval()
+
+            log_table = wandb.Table(
+                columns=[
+                    "Época",
+                    "Imagem",
+                    "Legenda Gerada",
+                    "Legenda de Referência",
+                ]
+            )
+            vocab = self.val_loader.dataset.vocab
+
+            for img, cap in self.val_samples:
+                gen_cap = self.model.generate_caption(
+                    image=img.to(self.device), max_length=50, vocab=vocab
+                )[0]
+
+                print(cap, vocab.decode(cap))
+                log_table.add_data(
+                    epoch, wandb.Image(tensor2pil(img)), gen_cap, vocab.decode(cap)
+                )
+
+            wandb.log({"previsões": log_table})
 
         def _run_epoch(
             self, loader: DataLoader, is_training: bool, epoch_num: int = 0
         ) -> float:
             if is_training:
                 self.model.train()
-                desc = f"Training Epoch {epoch_num}/{self.epochs}"
+                desc = f"Treinando época {epoch_num}/{self.epochs}"
             else:
                 self.model.eval()
-                desc = "Validating"
+                desc = "Validando"
 
             total_loss = 0.0
             progress_bar = tqdm(loader, desc=desc)
@@ -584,17 +625,31 @@ def _(
                             )
                         self.optimizer.step()
 
+                        wandb.log({"step_train_loss": loss.item()})
+
                     total_loss += loss.item()
 
             return total_loss / len(loader)
 
         def train(self):
             print(f"Começando o treino em {self.device}...")
+
+            wandb.watch(self.model, self.criterion, log="all", log_freq=100)
+
             for epoch in range(1, self.epochs + 1):
                 train_loss = self._run_epoch(
                     self.train_loader, is_training=True, epoch_num=epoch
                 )
                 val_loss = self._run_epoch(self.val_loader, is_training=False)
+
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "learning_rate": self.optimizer.param_groups[0]["lr"],
+                    }
+                )
 
                 print(
                     f"\nÉpoca {epoch}/{self.epochs}\n"
@@ -620,7 +675,7 @@ def _(
                         f"Novo melhor modelo salvo em {self.checkpoint_path} (Val Loss: {val_loss:.4f})"
                     )
 
-            print("Training finished.")
+                self._log_predictions(epoch)
     return (Trainer,)
 
 
@@ -634,6 +689,151 @@ def _(mo):
 def _(load_dataset):
     ds = load_dataset("jxie/flickr8k")
     return (ds,)
+
+
+@app.cell
+def _(
+    CaptionCollate,
+    DataLoader,
+    Decoder,
+    Encoder,
+    EncoderDecoder,
+    FlickrDataset,
+    RegNet_Y_1_6GF_Weights,
+    Trainer,
+    build_vocab_from_dataset,
+    load_dataset,
+    nn,
+    torch,
+    wandb,
+):
+    def run():
+        ds = load_dataset("jxie/flickr8k")
+        train_data = ds["train"]
+        val_data = ds["validation"]
+
+        vocab = build_vocab_from_dataset(train_data, min_freq=5)
+
+        config = {
+            # arquitetura
+            "decoder_type": "lstm",  # "lstm", "gru", "rnn"
+            "finetune_encoder": False,
+            "use_gate": True,
+            # hiperparâmetros
+            "vocab_size": len(vocab),
+            "embed_dim": 256,
+            "decoder_dim": 512,
+            "attention_dim": 512,
+            "encoder_dim": 888, # RegNet
+            "dropout": 0.5,
+            "encoder_lr": 1e-4,
+            "decoder_lr": 4e-4,
+            "batch_size": 32,
+            "epochs": 1,
+            "clip_grad_norm": 5.0,
+            "alpha_c": 1.0,  # regularização da atenção
+        }
+
+        wandb.init(
+            entity="theuvargas-universidade-federal-do-rio-de-janeiro",
+            project="show-attend-tell",
+            config=config,
+        )
+        config = wandb.config
+
+        weights = RegNet_Y_1_6GF_Weights.DEFAULT
+        transform = weights.transforms()
+
+        train_dataset = FlickrDataset(
+            dataset=train_data, vocab=vocab, transform=transform
+        )
+        val_dataset = FlickrDataset(
+            dataset=val_data, vocab=vocab, transform=transform
+        )
+
+        pad_idx = vocab.word2idx["<pad>"]
+        collate_fn = CaptionCollate(pad_idx=pad_idx)
+
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=collate_fn,
+        )
+
+        val_loader = DataLoader(
+            dataset=val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=collate_fn,
+        )
+
+        DEVICE = "cuda" # if torch.cuda.is_available() else "cpu"
+
+        encoder = Encoder(is_trainable=config.finetune_encoder)
+        decoder = Decoder(
+            embed_dim=config.embed_dim,
+            encoder_dim=config.encoder_dim,
+            decoder_dim=config.decoder_dim,
+            attention_dim=config.attention_dim,
+            vocab_size=config.vocab_size,
+            dropout=config.dropout,
+            decoder_type=config.decoder_type,
+            use_gate=config.use_gate,
+        )
+        model = EncoderDecoder(encoder, decoder)
+
+        optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": filter(
+                        lambda p: p.requires_grad, model.encoder.parameters()
+                    ),
+                    "lr": config.encoder_lr,
+                },
+                {
+                    "params": filter(
+                        lambda p: p.requires_grad, model.decoder.parameters()
+                    ),
+                    "lr": config.decoder_lr,
+                },
+            ]
+        )
+
+        criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.1, patience=3
+        )
+
+        checkpoint_filename = f"{wandb.run.name}-best.pth"
+
+        trainer = Trainer(
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=DEVICE,
+            epochs=config.epochs,
+            alpha_c=config.alpha_c,
+            lr_scheduler=lr_scheduler,
+            clip_grad_norm=config.clip_grad_norm,
+            checkpoint_path=checkpoint_filename,
+        )
+
+        try:
+            trainer.train()
+        finally:
+            wandb.finish()
+    return (run,)
+
+
+@app.cell
+def _(run):
+    run()
+    return
 
 
 @app.cell
