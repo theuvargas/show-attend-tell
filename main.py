@@ -586,13 +586,13 @@ def _(
             criterion: nn.Module,
             train_loader: DataLoader,
             val_loader: DataLoader,
-            device: str | torch.device,
-            epochs: int,
+            device: str | torch.device = "cuda",
+            epochs: int = 20,
             patience: int = 3,
             min_delta: float = 1e-3,
             alpha_c: float = 1.0,
             lr_scheduler: LRScheduler | None = None,
-            clip_grad_norm: float | None = None,
+            clip_grad_norm: float | None = 5,
             checkpoint_path: str = "best_model.pth",
         ):
             self.model = model.to(device)
@@ -751,12 +751,14 @@ def _(
                     )
                 else:
                     self.no_improvement_counter += 1
-                    print(f"Sem melhora na validação por {self.no_improvement_counter} épocas")
+                    print(
+                        f"Sem melhora na validação por {self.no_improvement_counter} épocas"
+                    )
 
                 if self.no_improvement_counter >= self.patience:
                     print(f"Parada antecipada na época {epoch}!")
                     break
-            
+
                 if self.lr_scheduler:
                     if isinstance(
                         self.lr_scheduler,
@@ -869,39 +871,18 @@ def _(
     wandb,
 ):
     def run():
+        wandb.init(
+            entity="theuvargas-universidade-federal-do-rio-de-janeiro",
+            project="show-attend-tell",
+        )
+        config = wandb.config
+
         ds = load_dataset("jxie/flickr8k")
         train_data = ds["train"]
         val_data = ds["validation"]
         test_data = ds["test"]
 
         vocab = build_vocab_from_dataset(train_data, min_freq=5)
-
-        config = {
-            # arquitetura
-            "decoder_type": "rnn",  # "lstm", "gru", "rnn"
-            "finetune_encoder": False,
-            "use_gate": False,
-            # hiperparâmetros
-            "vocab_size": len(vocab),
-            "embed_dim": 256,
-            "decoder_dim": 512,
-            "attention_dim": 512,
-            "encoder_dim": 888,  # RegNet
-            "dropout": 0.5,
-            "encoder_lr": 1e-4,
-            "decoder_lr": 4e-4,
-            "batch_size": 32,
-            "epochs": 1,
-            "clip_grad_norm": 5.0,
-            "alpha_c": 1.0,  # regularização da atenção
-        }
-
-        wandb.init(
-            entity="theuvargas-universidade-federal-do-rio-de-janeiro",
-            project="show-attend-tell",
-            config=config,
-        )
-        config = wandb.config
 
         weights = RegNet_Y_1_6GF_Weights.DEFAULT
         transform = weights.transforms()
@@ -912,9 +893,7 @@ def _(
         val_dataset = FlickrDataset(
             dataset=val_data, vocab=vocab, transform=transform
         )
-        test_dataset = FlickrTestDataset(
-            dataset=test_data, transform=transform
-        )
+        test_dataset = FlickrTestDataset(dataset=test_data, transform=transform)
 
         pad_idx = vocab.word2idx["<pad>"]
         collate_fn = CaptionCollate(pad_idx=pad_idx)
@@ -949,30 +928,32 @@ def _(
             embed_dim=config.embed_dim,
             encoder_dim=config.encoder_dim,
             decoder_dim=config.decoder_dim,
-            attention_dim=config.attention_dim,
-            vocab_size=config.vocab_size,
+            attention_dim=config.decoder_dim,
+            vocab_size=len(vocab),
             dropout=config.dropout,
             decoder_type=config.decoder_type,
             use_gate=config.use_gate,
         )
         model = EncoderDecoder(encoder, decoder)
 
-        optimizer = torch.optim.Adam(
-            [
+        param_groups = [
+            {
+                "params": filter(
+                    lambda p: p.requires_grad, model.decoder.parameters()
+                ),
+                "lr": config.decoder_lr,
+            }
+        ]
+        if config.finetune_encoder:
+            param_groups.append(
                 {
                     "params": filter(
                         lambda p: p.requires_grad, model.encoder.parameters()
                     ),
                     "lr": config.encoder_lr,
-                },
-                {
-                    "params": filter(
-                        lambda p: p.requires_grad, model.decoder.parameters()
-                    ),
-                    "lr": config.decoder_lr,
-                },
-            ]
-        )
+                }
+            )
+        optimizer = torch.optim.Adam(param_groups)
 
         criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -988,10 +969,10 @@ def _(
             train_loader=train_loader,
             val_loader=val_loader,
             device=DEVICE,
-            epochs=config.epochs,
             alpha_c=config.alpha_c,
             lr_scheduler=lr_scheduler,
             clip_grad_norm=config.clip_grad_norm,
+            epochs=config.epochs,
             checkpoint_path=checkpoint_filename,
         )
 
@@ -999,13 +980,15 @@ def _(
             trainer.train()
 
             print("Treinamento finalizado, começando a avaliar")
-        
-            model.load_state_dict(torch.load(checkpoint_filename, map_location=DEVICE))
+
+            model.load_state_dict(
+                torch.load(checkpoint_filename, map_location=DEVICE)
+            )
 
             scores = evaluate(model, test_loader, vocab, DEVICE)
 
             results_table = wandb.Table(columns=["Métrica", "Score"])
-        
+
             print("Métricas de teste:")
             for metric, score in scores.items():
                 print(f"{metric}: {score:.4f}")
@@ -1014,8 +997,10 @@ def _(
                 wandb.summary[f"test_{metric}"] = score
 
             wandb.log({"test_evaluation_results": results_table})
-        
-            best_model_artifact = wandb.Artifact(f"model-{wandb.run.name}", type="model")
+
+            best_model_artifact = wandb.Artifact(
+                f"model-{wandb.run.name}", type="model"
+            )
             best_model_artifact.add_file(checkpoint_filename)
             wandb.log_artifact(best_model_artifact)
         finally:
@@ -1024,8 +1009,48 @@ def _(
 
 
 @app.cell
-def _(run):
-    run()
+def _():
+    sweep_config = {
+        "method": "random",
+        "metric": {"name": "val_loss", "goal": "minimize"},
+        "early_terminate": {"type": "hyperband", "min_iter": 5},
+        "parameters": {
+            # Arquitetura
+            "decoder_type": {"values": ["lstm", "gru", "rnn"]},
+            "use_gate": {"values": [True, False]},
+            "finetune_encoder": {"value": False},
+            # Hiperparâmetros
+            "encoder_dim": {"value": 888},  # RegNet
+            "embed_dim": {"values": [256, 512]},
+            "decoder_dim": {"values": [256, 512, 768]},
+            "decoder_lr": {
+                "distribution": "log_uniform_values",
+                "min": 1e-4,
+                "max": 1e-3,
+            },
+            "dropout": {"distribution": "uniform", "min": 0.2, "max": 0.5},
+            "batch_size": {"values": [32, 64, 128]},
+            "alpha_c": {"values": [0.5, 1.0, 1.5]},
+            "epochs": {"value": 20},
+            "clip_grad_norm": {"value": 5},
+        },
+    }
+    return (sweep_config,)
+
+
+@app.cell
+def _(sweep_config, wandb):
+    sweep_id = wandb.sweep(
+        sweep_config,
+        entity="theuvargas-universidade-federal-do-rio-de-janeiro",
+        project="show-attend-tell"
+    )
+    return (sweep_id,)
+
+
+@app.cell
+def _(run, sweep_id, wandb):
+    wandb.agent(sweep_id, function=run, count=50)
     return
 
 
