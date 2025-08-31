@@ -588,6 +588,8 @@ def _(
             val_loader: DataLoader,
             device: str | torch.device,
             epochs: int,
+            patience: int = 3,
+            min_delta: float = 1e-3,
             alpha_c: float = 1.0,
             lr_scheduler: LRScheduler | None = None,
             clip_grad_norm: float | None = None,
@@ -600,6 +602,9 @@ def _(
             self.val_loader = val_loader
             self.device = device
             self.epochs = epochs
+            self.patience = patience
+            self.min_delta = min_delta
+            self.no_improvement_counter = 0
             self.alpha_c = alpha_c
             self.lr_scheduler = lr_scheduler
             self.clip_grad_norm = clip_grad_norm
@@ -737,6 +742,21 @@ def _(
                 self.history["train_loss"].append(train_loss)
                 self.history["val_loss"].append(val_loss)
 
+                if val_loss < self.best_val_loss - self.min_delta:
+                    self.best_val_loss = val_loss
+                    self.no_improvement_counter = 0
+                    torch.save(self.model.state_dict(), self.checkpoint_path)
+                    print(
+                        f"Novo melhor modelo salvo em {self.checkpoint_path} (val_loss: {val_loss:.4f})"
+                    )
+                else:
+                    self.no_improvement_counter += 1
+                    print(f"Sem melhora na validação por {self.no_improvement_counter} épocas")
+
+                if self.no_improvement_counter >= self.patience:
+                    print(f"Parada antecipada na época {epoch}!")
+                    break
+            
                 if self.lr_scheduler:
                     if isinstance(
                         self.lr_scheduler,
@@ -745,13 +765,6 @@ def _(
                         self.lr_scheduler.step(val_loss)
                     else:
                         self.lr_scheduler.step()
-
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    torch.save(self.model.state_dict(), self.checkpoint_path)
-                    print(
-                        f"Novo melhor modelo salvo em {self.checkpoint_path} (Val Loss: {val_loss:.4f})"
-                    )
 
                 self._log_predictions(epoch)
     return (Trainer,)
@@ -867,7 +880,7 @@ def _(
             # arquitetura
             "decoder_type": "rnn",  # "lstm", "gru", "rnn"
             "finetune_encoder": False,
-            "use_gate": True,
+            "use_gate": False,
             # hiperparâmetros
             "vocab_size": len(vocab),
             "embed_dim": 256,
