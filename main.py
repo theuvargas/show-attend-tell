@@ -382,6 +382,8 @@ def _(Attention, Literal, nn, torch):
             embeddings = self.embedding(captions)
 
             decode_length = max(caption_lengths) - 1
+            if decode_length < 0:
+                decode_length = 0
 
             predictions = torch.zeros(
                 batch_size, decode_length, self.vocab_size
@@ -902,7 +904,7 @@ def _(
             dataset=train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=0,
             collate_fn=collate_fn,
         )
 
@@ -910,7 +912,7 @@ def _(
             dataset=val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=0,
             collate_fn=collate_fn,
         )
 
@@ -918,7 +920,7 @@ def _(
             dataset=test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=4,
+            num_workers=0,
         )
 
         DEVICE = "cuda"  # if torch.cuda.is_available() else "cpu"
@@ -956,9 +958,15 @@ def _(
         optimizer = torch.optim.Adam(param_groups)
 
         criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.1, patience=3
-        )
+    
+        lr_scheduler = None
+        if config.scheduler_type == "plateau":
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.1,
+                patience=config.lr_patience
+            )
 
         checkpoint_filename = f"{wandb.run.name}-best.pth"
 
@@ -973,6 +981,7 @@ def _(
             lr_scheduler=lr_scheduler,
             clip_grad_norm=config.clip_grad_norm,
             epochs=config.epochs,
+            patience=config.epochs_patience,
             checkpoint_path=checkpoint_filename,
         )
 
@@ -1032,7 +1041,10 @@ def _():
             "batch_size": {"values": [32, 64, 128]},
             "alpha_c": {"values": [0.5, 1.0, 1.5]},
             "epochs": {"value": 20},
+            "epochs_patience": {"value": 5},
             "clip_grad_norm": {"value": 5},
+            "scheduler_type": {"value": "plateau"},
+            "lr_patience": {"value": 2},
         },
     }
     return (sweep_config,)
@@ -1051,6 +1063,11 @@ def _(sweep_config, wandb):
 @app.cell
 def _(run, sweep_id, wandb):
     wandb.agent(sweep_id, function=run, count=50)
+    return
+
+
+@app.cell
+def _():
     return
 
 
