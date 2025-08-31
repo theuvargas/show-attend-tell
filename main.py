@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.15.0"
+__generated_with = "0.15.2"
 app = marimo.App(width="medium")
 
 
@@ -26,15 +26,23 @@ def _():
     import torch.nn.functional as F
     from PIL import Image
     import matplotlib.pyplot as plt
+    from pycocoevalcap.bleu.bleu import Bleu
+    from pycocoevalcap.meteor.meteor import Meteor
+    from pycocoevalcap.rouge.rouge import Rouge
+    from pycocoevalcap.cider.cider import Cider
     return (
+        Bleu,
+        Cider,
         Counter,
         DataLoader,
         Dataset,
         F,
         LRScheduler,
         Literal,
+        Meteor,
         Optimizer,
         RegNet_Y_1_6GF_Weights,
+        Rouge,
         load_dataset,
         mo,
         nn,
@@ -104,7 +112,7 @@ def _(Counter, re, torch):
 
             if isinstance(seq, int):
                 seq = [seq]
-            
+
             return " ".join(
                 [self.idx2word.get(idx, "<unk>") for idx in seq if idx >= 3]
             )
@@ -756,9 +764,77 @@ def _(mo):
 
 
 @app.cell
-def _(load_dataset):
-    ds = load_dataset("jxie/flickr8k")
-    return
+def _(Dataset):
+    class FlickrTestDataset(Dataset):
+        def __init__(self, dataset, transform):
+            self.dataset = dataset
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.dataset)
+
+        def __getitem__(self, idx):
+            item = self.dataset[idx]
+            image = item["image"].convert("RGB")
+            image = self.transform(image)
+
+            captions = [item[f"caption_{i}"] for i in range(5)]
+
+            return image, captions
+    return (FlickrTestDataset,)
+
+
+@app.cell
+def _(
+    Bleu,
+    Cider,
+    DataLoader,
+    EncoderDecoder,
+    Meteor,
+    Rouge,
+    Vocabulary,
+    torch,
+    tqdm,
+):
+    def evaluate(model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, device: str):
+        model.eval()
+
+        generated = {}
+        references = {}
+
+        with torch.no_grad():
+            for i, (images, caps_list) in enumerate(tqdm(loader, desc="Avaliando")):
+                if images.size(0) != 1:
+                    raise ValueError("Loader dever ter batch_size=1")
+                
+                image = images.to(device)
+
+                generated_caption, _, _ = model.generate_caption(
+                    image, vocab, max_length=50
+                )
+
+                generated[i] = [generated_caption]
+                references[i] = list(caps_list[0])
+    
+        scorers = [
+            (Bleu(4), ["BLEU_1", "BLEU_2", "BLEU_3", "BLEU_4"]),
+            (Meteor(), "METEOR"),
+            (Rouge(), "ROUGE_L"),
+            (Cider(), "CIDEr")
+        ]
+
+        final_scores = {}
+        for scorer, method in scorers:
+            score, scores = scorer.compute_score(references, generated)
+        
+            if isinstance(method, list): # BLEU
+                for sc, scs in zip(score, method):
+                    final_scores[scs] = sc
+            else: # METEOR, ROUGE_L, CIDEr
+                final_scores[method] = score
+
+        return final_scores
+    return (evaluate,)
 
 
 @app.cell
@@ -769,9 +845,11 @@ def _(
     Encoder,
     EncoderDecoder,
     FlickrDataset,
+    FlickrTestDataset,
     RegNet_Y_1_6GF_Weights,
     Trainer,
     build_vocab_from_dataset,
+    evaluate,
     load_dataset,
     nn,
     torch,
@@ -781,12 +859,13 @@ def _(
         ds = load_dataset("jxie/flickr8k")
         train_data = ds["train"]
         val_data = ds["validation"]
+        test_data = ds["test"]
 
         vocab = build_vocab_from_dataset(train_data, min_freq=5)
 
         config = {
             # arquitetura
-            "decoder_type": "lstm",  # "lstm", "gru", "rnn"
+            "decoder_type": "rnn",  # "lstm", "gru", "rnn"
             "finetune_encoder": False,
             "use_gate": True,
             # hiperparâmetros
@@ -820,6 +899,9 @@ def _(
         val_dataset = FlickrDataset(
             dataset=val_data, vocab=vocab, transform=transform
         )
+        test_dataset = FlickrTestDataset(
+            dataset=test_data, transform=transform
+        )
 
         pad_idx = vocab.word2idx["<pad>"]
         collate_fn = CaptionCollate(pad_idx=pad_idx)
@@ -838,6 +920,13 @@ def _(
             shuffle=False,
             num_workers=4,
             collate_fn=collate_fn,
+        )
+
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
         )
 
         DEVICE = "cuda"  # if torch.cuda.is_available() else "cpu"
@@ -895,6 +984,27 @@ def _(
 
         try:
             trainer.train()
+
+            print("Treinamento finalizado, começando a avaliar")
+        
+            model.load_state_dict(torch.load(checkpoint_filename, map_location=DEVICE))
+
+            scores = evaluate(model, test_loader, vocab, DEVICE)
+
+            results_table = wandb.Table(columns=["Métrica", "Score"])
+        
+            print("Métricas de teste:")
+            for metric, score in scores.items():
+                print(f"{metric}: {score:.4f}")
+                results_table.add_data(metric, score)
+
+                wandb.summary[f"test_{metric}"] = score
+
+            wandb.log({"test_evaluation_results": results_table})
+        
+            best_model_artifact = wandb.Artifact(f"model-{wandb.run.name}", type="model")
+            best_model_artifact.add_file(checkpoint_filename)
+            wandb.log_artifact(best_model_artifact)
         finally:
             wandb.finish()
     return (run,)
