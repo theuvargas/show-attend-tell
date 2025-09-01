@@ -30,6 +30,7 @@ def _():
     from pycocoevalcap.meteor.meteor import Meteor
     from pycocoevalcap.rouge.rouge import Rouge
     from pycocoevalcap.cider.cider import Cider
+    from pycocoevalcap.spice.spice import Spice
     return (
         Bleu,
         Cider,
@@ -43,6 +44,7 @@ def _():
         Optimizer,
         RegNet_Y_1_6GF_Weights,
         Rouge,
+        Spice,
         load_dataset,
         mo,
         nn,
@@ -809,11 +811,14 @@ def _(
     EncoderDecoder,
     Meteor,
     Rouge,
+    Spice,
     Vocabulary,
     torch,
     tqdm,
 ):
-    def evaluate(model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, device: str):
+    def evaluate(
+        model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, device: str
+    ):
         model.eval()
 
         generated = {}
@@ -823,7 +828,7 @@ def _(
             for i, (images, caps_list) in enumerate(tqdm(loader, desc="Avaliando")):
                 if images.size(0) != 1:
                     raise ValueError("Loader dever ter batch_size=1")
-                
+
                 image = images.to(device)
 
                 generated_caption, _, _ = model.generate_caption(
@@ -832,22 +837,23 @@ def _(
 
                 generated[i] = [generated_caption]
                 references[i] = list(caps_list[0])
-    
+
         scorers = [
             (Bleu(4), ["BLEU_1", "BLEU_2", "BLEU_3", "BLEU_4"]),
             (Meteor(), "METEOR"),
             (Rouge(), "ROUGE_L"),
-            (Cider(), "CIDEr")
+            (Cider(), "CIDEr"),
+            (Spice(), "SPICE"),
         ]
 
         final_scores = {}
         for scorer, method in scorers:
             score, scores = scorer.compute_score(references, generated)
-        
-            if isinstance(method, list): # BLEU
+
+            if isinstance(method, list):  # BLEU
                 for sc, scs in zip(score, method):
                     final_scores[scs] = sc
-            else: # METEOR, ROUGE_L, CIDEr
+            else:  # METEOR, ROUGE_L, CIDEr, SPICE
                 final_scores[method] = score
 
         return final_scores
@@ -958,7 +964,7 @@ def _(
         optimizer = torch.optim.Adam(param_groups)
 
         criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
-    
+
         lr_scheduler = None
         if config.scheduler_type == "plateau":
             lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

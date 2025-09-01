@@ -22,6 +22,7 @@ from pycocoevalcap.bleu.bleu import Bleu
 from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
 
 class Vocabulary:
     def __init__(self, min_freq):
@@ -685,7 +686,8 @@ def evaluate(model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, devic
         (Bleu(4), ["BLEU_1", "BLEU_2", "BLEU_3", "BLEU_4"]),
         (Meteor(), "METEOR"),
         (Rouge(), "ROUGE_L"),
-        (Cider(), "CIDEr")
+        (Cider(), "CIDEr"),
+        (Spice(), "SPICE"),
     ]
 
     final_scores = {}
@@ -695,7 +697,7 @@ def evaluate(model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, devic
         if isinstance(method, list): # BLEU
             for sc, scs in zip(score, method):
                 final_scores[scs] = sc
-        else: # METEOR, ROUGE_L, CIDEr
+        else: # METEOR, ROUGE_L, CIDEr, SPICE
             final_scores[method] = score
 
     return final_scores
@@ -844,26 +846,25 @@ def run():
         wandb.finish()
 
 sweep_config = {
-    "method": "random",
+    "method": "bayes",
     "metric": {"name": "val_loss", "goal": "minimize"},
-    # "early_terminate": {"type": "hyperband", "min_iter": 5},
     "parameters": {
         # Arquitetura
-        "decoder_type": {"values": ["lstm", "gru", "rnn"]},
-        "use_gate": {"values": [True, False]},
+        "decoder_type": {"value": "lstm"},
+        "use_gate": {"value": True},
         "finetune_encoder": {"value": False},
         # Hiperparâmetros
         "encoder_dim": {"value": 888},  # RegNet
         "embed_dim": {"values": [256, 512]},
-        "decoder_dim": {"values": [256, 512, 768]},
+        "decoder_dim": {"values": [512, 768]},
         "decoder_lr": {
             "distribution": "log_uniform_values",
-            "min": 1e-4,
-            "max": 1e-3,
+            "min": 4e-4,
+            "max": 2e-3,
         },
-        "dropout": {"distribution": "uniform", "min": 0.2, "max": 0.5},
-        "batch_size": {"values": [32, 64, 128]},
-        "alpha_c": {"values": [0.5, 1.0, 1.5]},
+        "dropout": {"distribution": "uniform", "min": 0.35, "max": 0.7},
+        "batch_size": {"values": [32, 64]},
+        "alpha_c": {"distribution": "uniform", "min": 0.0, "max": 0.7},
         "epochs": {"value": 20},
         "epochs_patience": {"value": 5},
         "clip_grad_norm": {"value": 5},
@@ -878,4 +879,4 @@ sweep_id = wandb.sweep(
     project="show-attend-tell"
 )
 
-wandb.agent(sweep_id, function=run, count=50)
+wandb.agent(sweep_id, function=run, count=20)
