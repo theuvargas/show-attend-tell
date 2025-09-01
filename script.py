@@ -855,16 +855,16 @@ sweep_config = {
         "finetune_encoder": {"value": False},
         # Hiperparâmetros
         "encoder_dim": {"value": 888},  # RegNet
-        "embed_dim": {"values": [256, 512]},
-        "decoder_dim": {"values": [512, 768]},
+        "embed_dim": {"value": 256},
+        "decoder_dim": {"value": 768},
         "decoder_lr": {
             "distribution": "log_uniform_values",
-            "min": 4e-4,
-            "max": 2e-3,
+            "min": 5e-5,
+            "max": 5e-4,
         },
-        "dropout": {"distribution": "uniform", "min": 0.35, "max": 0.7},
-        "batch_size": {"values": [32, 64]},
-        "alpha_c": {"distribution": "uniform", "min": 0.0, "max": 0.7},
+        "dropout": {"distribution": "uniform", "min": 0.5, "max": 0.8},
+        "batch_size": {"value": 32},
+        "alpha_c": {"distribution": "uniform", "min": 0.1, "max": 0.5},
         "epochs": {"value": 20},
         "epochs_patience": {"value": 5},
         "clip_grad_norm": {"value": 5},
@@ -879,4 +879,4 @@ sweep_id = wandb.sweep(
     project="show-attend-tell"
 )
 
-wandb.agent(sweep_id, function=run, count=20)
+wandb.agent(sweep_id, function=run, count=15)
