@@ -461,10 +461,11 @@ class Trainer:
         criterion: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        vocab: Vocabulary,
         device: str | torch.device = "cuda",
         epochs: int = 20,
         patience: int = 3,
-        min_delta: float = 1e-3,
+        min_delta: float = 1e-4,
         alpha_c: float = 1.0,
         lr_scheduler: LRScheduler | None = None,
         clip_grad_norm: float | None = 5,
@@ -475,6 +476,7 @@ class Trainer:
         self.criterion = criterion
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.vocab = vocab
         self.device = device
         self.epochs = epochs
         self.patience = patience
@@ -485,8 +487,8 @@ class Trainer:
         self.clip_grad_norm = clip_grad_norm
         self.checkpoint_path = checkpoint_path
 
-        self.best_val_loss = float("inf")
-        self.history = {"train_loss": [], "val_loss": []}
+        self.best_val_metric = -float("inf")
+        self.history = {"train_loss": [], "val_loss": [], "val_cider": []}
 
         self.val_samples = []
         images, captions, _ = next(iter(train_loader))
@@ -594,17 +596,29 @@ class Trainer:
 
         wandb.watch(self.model, self.criterion, log="all", log_freq=100)
 
+        temp_val_dataset = FlickrTestDataset(
+            dataset=self.val_loader.dataset.dataset,
+            transform=self.val_loader.dataset.transform
+        )
+        metric_val_loader = DataLoader(dataset=temp_val_dataset, batch_size=1, shuffle=False)
+
+
         for epoch in range(1, self.epochs + 1):
             train_loss = self._run_epoch(
                 self.train_loader, is_training=True, epoch_num=epoch
             )
             val_loss = self._run_epoch(self.val_loader, is_training=False)
 
+            print("Calculando métricas de validação...")
+            val_scores = evaluate(self.model, metric_val_loader, self.vocab, self.device)
+            val_cider = val_scores.get("CIDEr", 0.0)
+            
             wandb.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
+                    "val_cider": val_cider,
                     "learning_rate": self.optimizer.param_groups[0]["lr"],
                 }
             )
@@ -616,18 +630,19 @@ class Trainer:
 
             self.history["train_loss"].append(train_loss)
             self.history["val_loss"].append(val_loss)
+            self.history["val_cider"].append(val_cider)
 
-            if val_loss < self.best_val_loss - self.min_delta:
-                self.best_val_loss = val_loss
+            if val_cider > self.best_val_metric + self.min_delta:
+                self.best_val_metric = val_cider
                 self.no_improvement_counter = 0
                 torch.save(self.model.state_dict(), self.checkpoint_path)
                 print(
-                    f"Novo melhor modelo salvo em {self.checkpoint_path} (val_loss: {val_loss:.4f})"
+                    f"Novo melhor modelo salvo em {self.checkpoint_path} (val_cider: {val_cider:.4f})"
                 )
             else:
                 self.no_improvement_counter += 1
                 print(
-                    f"Sem melhora na validação por {self.no_improvement_counter} épocas"
+                    f"Sem melhora no CIDEr por {self.no_improvement_counter} épocas"
                 )
 
             if self.no_improvement_counter >= self.patience:
@@ -702,10 +717,32 @@ def evaluate(model: EncoderDecoder, loader: DataLoader, vocab: Vocabulary, devic
 
     return final_scores
 
-def run():
+
+def run_finetune():
+    config_params = {
+        "best_model_path": "./driven-sweep-1-best.pth",
+        "decoder_type": "lstm",
+        "use_gate": True,
+        "embed_dim": 256,
+        "decoder_dim": 768,
+        "batch_size": 32,
+        "alpha_c": 0.33787,
+        "dropout": 0.7251,
+        "encoder_dim": 888,
+        "clip_grad_norm": 5.0,
+        "scheduler_type": "plateau",
+        "lr_patience": 2,
+        "epochs": 10,
+        "epochs_patience": 3,
+        "finetune_decoder_lr": 1e-5,
+        "finetune_encoder_lr": 1e-5,
+    }
+
     wandb.init(
         entity="theuvargas-universidade-federal-do-rio-de-janeiro",
         project="show-attend-tell",
+        job_type="fine-tuning",
+        config=config_params,
     )
     config = wandb.config
 
@@ -719,43 +756,28 @@ def run():
     weights = RegNet_Y_1_6GF_Weights.DEFAULT
     transform = weights.transforms()
 
-    train_dataset = FlickrDataset(
-        dataset=train_data, vocab=vocab, transform=transform
-    )
-    val_dataset = FlickrDataset(
-        dataset=val_data, vocab=vocab, transform=transform
-    )
+    train_dataset = FlickrDataset(dataset=train_data, vocab=vocab, transform=transform)
+    val_dataset = FlickrDataset(dataset=val_data, vocab=vocab, transform=transform)
     test_dataset = FlickrTestDataset(dataset=test_data, transform=transform)
 
     pad_idx = vocab.word2idx["<pad>"]
     collate_fn = CaptionCollate(pad_idx=pad_idx)
 
     train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collate_fn,
+        dataset=train_dataset, batch_size=config.batch_size, shuffle=True,
+        num_workers=4, collate_fn=collate_fn
     )
-
     val_loader = DataLoader(
-        dataset=val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=2,
-        collate_fn=collate_fn,
+        dataset=val_dataset, batch_size=config.batch_size, shuffle=False,
+        num_workers=2, collate_fn=collate_fn
     )
-
     test_loader = DataLoader(
-        dataset=test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=2,
+        dataset=test_dataset, batch_size=1, shuffle=False, num_workers=2
     )
 
-    DEVICE = "cuda"  # if torch.cuda.is_available() else "cpu"
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    encoder = Encoder(is_trainable=config.finetune_encoder)
+    encoder = Encoder(is_trainable=True) 
     decoder = Decoder(
         embed_dim=config.embed_dim,
         encoder_dim=config.encoder_dim,
@@ -768,23 +790,25 @@ def run():
     )
     model = EncoderDecoder(encoder, decoder)
 
+    try:
+        model.load_state_dict(torch.load(config.best_model_path, map_location=DEVICE))
+    except FileNotFoundError:
+        return
+
+    for param in model.encoder.parameters():
+        param.requires_grad = True
+
+
     param_groups = [
         {
-            "params": filter(
-                lambda p: p.requires_grad, model.decoder.parameters()
-            ),
-            "lr": config.decoder_lr,
+            "params": model.decoder.parameters(),
+            "lr": config.finetune_decoder_lr,
+        },
+        {
+            "params": model.encoder.parameters(),
+            "lr": config.finetune_encoder_lr,
         }
     ]
-    if config.finetune_encoder:
-        param_groups.append(
-            {
-                "params": filter(
-                    lambda p: p.requires_grad, model.encoder.parameters()
-                ),
-                "lr": config.encoder_lr,
-            }
-        )
     optimizer = torch.optim.Adam(param_groups)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
@@ -792,13 +816,10 @@ def run():
     lr_scheduler = None
     if config.scheduler_type == "plateau":
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.1,
-            patience=config.lr_patience
+            optimizer, mode="min", factor=0.1, patience=config.lr_patience
         )
 
-    checkpoint_filename = f"{wandb.run.name}-best.pth"
+    checkpoint_filename = f"{wandb.run.name}-best-finetuned.pth"
 
     trainer = Trainer(
         model=model,
@@ -806,6 +827,7 @@ def run():
         criterion=criterion,
         train_loader=train_loader,
         val_loader=val_loader,
+        vocab=vocab,
         device=DEVICE,
         alpha_c=config.alpha_c,
         lr_scheduler=lr_scheduler,
@@ -818,8 +840,6 @@ def run():
     try:
         trainer.train()
 
-        print("Treinamento finalizado, começando a avaliar")
-
         model.load_state_dict(
             torch.load(checkpoint_filename, map_location=DEVICE)
         )
@@ -828,11 +848,9 @@ def run():
 
         results_table = wandb.Table(columns=["Métrica", "Score"])
 
-        print("Métricas de teste:")
         for metric, score in scores.items():
             print(f"{metric}: {score:.4f}")
             results_table.add_data(metric, score)
-
             wandb.summary[f"test_{metric}"] = score
 
         wandb.log({"test_evaluation_results": results_table})
@@ -842,41 +860,10 @@ def run():
         )
         best_model_artifact.add_file(checkpoint_filename)
         wandb.log_artifact(best_model_artifact)
+
     finally:
         wandb.finish()
 
-sweep_config = {
-    "method": "bayes",
-    "metric": {"name": "val_loss", "goal": "minimize"},
-    "parameters": {
-        # Arquitetura
-        "decoder_type": {"value": "lstm"},
-        "use_gate": {"value": True},
-        "finetune_encoder": {"value": False},
-        # Hiperparâmetros
-        "encoder_dim": {"value": 888},  # RegNet
-        "embed_dim": {"value": 256},
-        "decoder_dim": {"value": 768},
-        "decoder_lr": {
-            "distribution": "log_uniform_values",
-            "min": 5e-5,
-            "max": 5e-4,
-        },
-        "dropout": {"distribution": "uniform", "min": 0.5, "max": 0.8},
-        "batch_size": {"value": 32},
-        "alpha_c": {"distribution": "uniform", "min": 0.1, "max": 0.5},
-        "epochs": {"value": 20},
-        "epochs_patience": {"value": 5},
-        "clip_grad_norm": {"value": 5},
-        "scheduler_type": {"value": "plateau"},
-        "lr_patience": {"value": 2},
-    },
-}
 
-sweep_id = wandb.sweep(
-    sweep_config,
-    entity="theuvargas-universidade-federal-do-rio-de-janeiro",
-    project="show-attend-tell"
-)
-
-wandb.agent(sweep_id, function=run, count=15)
+if __name__ == "__main__":
+    run_finetune()
